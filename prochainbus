@@ -1,0 +1,123 @@
+#!/usr/bin/perl
+# Affiche les prochains passages de bus et de trams de la
+# CTS. 
+
+# Copyright 2011 - Martijn van der Kwast <martijn@vdkwast.com> Utilisation à
+# vos risques, l'auteur ne saura être tenu responsable d'éventuelles
+# informations erronées et des retards qui en suivraient. Distribution libre à
+# condition de laisser ce paragraphe. 
+
+use LWP::Simple;
+use HTML::TreeBuilder::XPath;
+use Getopt::Long qw/:config no_ignore_case bundling/;
+
+use warnings;
+use strict;
+
+# Le système de la CTS renvoie des données en utf8 qu'il faut
+# afficher telles quelles.
+use utf8;
+use open qw/:std :utf8/;
+
+our $VERSION = '0.0.3';
+
+# fichier de configuration contenant juste le code de l'arrêt
+my $config_file='~/.prochainbus';
+
+# affiche des informations sur la progression du script
+my $verbose=0;
+
+# options de ligne de commande
+my %options = (
+    'help|h' => \&abort_with_help,
+    'verbose|v+' => \$verbose,
+    'version|V' => \&abort_with_version,
+);
+
+sub abort_with_help() {
+    print <<"HELP";
+prochainbus [options] [code_arret]
+options:
+    --help, -h	    Affiche cette aide
+    --version, -V   Affiche la version
+    --verbose, -v   Affiche plus d'informations
+
+code_arret:
+    Le code affiché aux arrêts de trams ou de bus.
+
+Si le code de l'arrêt n'est pas spécifié, il sera cherché
+dans $config_file.
+HELP
+    exit -1;
+}
+
+sub abort_with_version() {
+    print <<"VERSION";
+$0 version $VERSION
+copyright 2011 by Martijn van der Kwast <martijn\@vdkwast.com> 
+VERSION
+    exit 0;
+}
+
+sub service_error {
+    print STDERR join(' ', @_) . "\n";
+    exit -2;
+}
+
+# Déterminer l'arrêt
+
+GetOptions(%options) || abort_with_help;
+
+my $arret=$ARGV[0];
+unless (defined $arret) {
+    $config_file = glob $config_file;
+    if (-f $config_file) {
+	open my $fh, '<', $config_file or die $!;
+	$arret=<$fh>;
+	chomp $arret;
+    }
+}
+unless (defined $arret) {
+    print STDERR "Veuillez spécifier un code d'arrêt.\n";
+    exit -1;
+}
+
+print "Recherche du code arrêt: '$arret'\n" if $verbose > 1;
+
+# Téléchargement des infos sur le site CTS
+
+my ($heure, $min) = (localtime time)[2,1];
+my $url="http://tr.cts-strasbourg.fr/HorTRweb/ResultatsHoraires.aspx?arret=$arret&type=TOUS&heure=$heure&min=$min";
+
+printf "Téléchargement des informations sur '$url' pour l'heure %02d:%02d.\n",
+    $heure, $min if $verbose > 1;
+
+my $content = get $url;
+service_error "Service CTS non accessible." unless defined $content;
+
+print "Téléchargement terminé.\n" if $verbose > 1;
+
+# Analyse et affichage des infos
+
+my $xp = HTML::TreeBuilder::XPath->new;
+$xp->parse($content);
+
+my $error = $xp->findnodes(q{//div[@id='ctl00_ContentPlaceHolder_ValidationSummary1']/font});
+service_error "Erreur renvoyée par le site: $error\n" if $error;
+
+my $nom_arret = $xp->findvalue(q{//div[@class='depart2']//span[@id='ctl00_ContentPlaceHolder_lblArret']});
+print "Arrêt: $nom_arret\n" if $verbose;
+
+my @nodes = $xp->findnodes('//table/tr[td]');
+
+unless (@nodes) {
+    service_error "Réponse du service CTS ne correspondant pas aux attentes. Peut-être ont-ils mis à jour leur système ?";
+}
+
+foreach my $node (@nodes) {
+    my $dest = $node->findvalue('td[2]');
+    my $time = $node->findvalue('td[3]');
+    print "$time: $dest\n";
+}
+
+print "Analyse du résultat terminée.\n" if $verbose > 1;
