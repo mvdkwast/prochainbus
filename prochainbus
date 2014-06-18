@@ -1,123 +1,351 @@
 #!/usr/bin/perl
-# Affiche les prochains passages de bus et de trams de la
-# CTS. 
 
-# Copyright 2011 - Martijn van der Kwast <martijn@vdkwast.com> Utilisation à
-# vos risques, l'auteur ne saura être tenu responsable d'éventuelles
-# informations erronées et des retards qui en suivraient. Distribution libre à
-# condition de laisser ce paragraphe. 
-
+use v5.14;
+use JSON::PP;
 use LWP::Simple;
-use HTML::TreeBuilder::XPath;
 use Getopt::Long qw/:config no_ignore_case bundling/;
+use String::Approx 'amatch';
+use File::Slurp qw/read_file write_file/;
+use Unicode::Normalize;
+use HTML::TreeBuilder::XPath;
+use I18N::Langinfo qw/langinfo CODESET/;
+use Encode qw/decode/;
 
-use warnings;
 use strict;
+use warnings;
 
 # Le système de la CTS renvoie des données en utf8 qu'il faut
 # afficher telles quelles.
 use utf8;
 use open qw/:std :utf8/;
 
-our $VERSION = '0.0.3';
+our $VERSION = '0.0.4';
 
-# fichier de configuration contenant juste le code de l'arrêt
-my $config_file='~/.prochainbus';
+# config 
+my $config_path = "$ENV{HOME}/.prochainbus/";
+my $default_stop_file = $config_path . 'default';
+my $stops_file = $config_path . 'stops';
 
-# affiche des informations sur la progression du script
-my $verbose=0;
+my $cts_api_url = 'http://cts.api.strasbourg-data.fr/';
 
-# options de ligne de commande
-my %options = (
-    'help|h' => \&abort_with_help,
-    'verbose|v+' => \$verbose,
-    'version|V' => \&abort_with_version,
-);
+my $amatch_mods = ['I1', 'D1', 'S1', 'i'];
 
-sub abort_with_help() {
-    print <<"HELP";
-prochainbus [options] [code_arret]
-options:
-    --help, -h	    Affiche cette aide
-    --version, -V   Affiche la version
-    --verbose, -v   Affiche plus d'informations
+my $verbose = 0;
 
-code_arret:
-    Le code affiché aux arrêts de trams ou de bus.
+sub get_passages { &get_passages_from_hack; }
+#sub get_passages { &get_passages_from_api; }
 
-Si le code de l'arrêt n'est pas spécifié, il sera cherché
-dans $config_file.
-HELP
+sub trace {
+    my $level = shift;
+    say join(' ', @_) if $verbose >= $level;
+}
+
+# remplace die en utilisant directement exit pour éviter
+# que GetOptions n'intercepte le signal
+sub creve {
+    say STDERR join(' ', @_);
     exit -1;
 }
 
-sub abort_with_version() {
+sub remove_accents {
+    my $s = shift;
+    my $ret = NFKD($s);
+    $ret =~ s/\p{NonSpacingMark}//g;
+    return $ret;
+}
+
+sub fuzzy_match {
+    my ($needle, $hay) = @_;
+    $needle = remove_accents $needle;
+    $_ = remove_accents $hay;
+    return amatch($needle, $amatch_mods);
+}
+
+sub show_help {
+    print <<"HELP";
+prochainbus [options] 
+prochainbus <code | expr>
+options:
+    --help, -h	         Affiche cette aide
+    --version, -V        Affiche la version
+    --verbose, -v        Affiche plus d'informations
+    --list, -l           Affiche les arrêts disponibles
+    --refresh, -R        Actualise la liste d'arrêts
+    --find, -f <expr>    Affiche les arrêts correspondant à expr
+    --match, -m <expr>   Affiche les prochains passages à l'arrêt <expr>
+                         si <expr> correspond à un arrêt unique.
+
+code_arret:
+    Le code affiché aux arrêts de trams ou de bus.
+expr:
+    le nom approximatif d'un arrêt.
+
+Si le code de l'arrêt n'est pas spécifié, il sera cherché dans 
+$default_stop_file.
+HELP
+}
+
+sub abort_with_help {
+    show_help;
+    exit -1;
+}
+
+sub get_default_code {
+    my $code = read_file($default_stop_file)
+        if -f $default_stop_file;
+
+    if (defined $code) {
+        chomp $code;
+    }
+
+    return $code;
+}
+
+sub make_config {
+    my $default_code;
+    my $old_config = "$ENV{HOME}/.prochainbus";
+
+    if (-f $old_config) {
+        # upgrade from previous version
+        trace 1, "detected old config. Upgrading.";
+        $default_code = read_file $old_config;
+        chomp $default_code;
+        unlink $old_config
+            or creve "Could not upgrade configuration from previous version";
+    }
+
+    unless (-d $config_path) {
+        trace 1, "Creating config paths";
+        mkdir $config_path
+            or creve "Could not create config path ($config_path): $!";
+    }
+
+    unless (-f $stops_file) {
+        get_stops();
+    }
+
+    if (defined $default_code) {
+        write_file $default_stop_file, $default_code;
+    }
+}
+
+# retrieve stops cache from CTS site
+sub get_stops {
+    trace 1, "Retrieving stops file";
+
+    my $rc = getstore($cts_api_url . 'stops', $stops_file);
+    creve "Service CTS non accessible ($rc)"
+        unless is_success($rc);
+}
+
+# retreive next passages for stop from CTS site
+# Drawback is that it only lists a few passages. Also it seems to list times from 2 hours ago.
+sub get_passages_from_api {
+    my $code = shift;
+    trace 1, "Retrieving passages file";
+
+    my $data = get($cts_api_url . 'stops/' . $code);
+    creve "Service CTS non accessible ou code arrêt non trouvé"
+        unless defined $data;
+
+    my $json = decode_json($data);
+    use Data::Dumper;
+    say Dumper($json);
+
+    return [];
+}
+
+# retrieve next passages by scrubbing web interface.
+# Drawback is that it may change and it doesn't seem to recognize some stop codes. (eg. Kepler, 726)
+sub get_passages_from_hack {
+    my $arret = shift;
+    my ($heure, $min) = (localtime time)[2,1];
+    my @passages;
+    my $url="http://tr.cts-strasbourg.fr/HorTRweb/ResultatsHoraires.aspx?arret=$arret&type=TOUS&heure=$heure&min=$min";
+
+    trace 1, sprintf("Téléchargement des informations sur '$url' pour l'heure %02d:%02d.", $heure, $min);
+
+    my $content = get $url;
+    creve "Service CTS non accessible." 
+        unless defined $content;
+
+    trace 1, "Téléchargement terminé.";
+
+    # Analyse et affichage des infos
+    my $xp = HTML::TreeBuilder::XPath->new;
+    $xp->parse($content);
+
+    my $error = $xp->findnodes(q{//div[@id='ctl00_ContentPlaceHolder_ValidationSummary1']/font});
+    creve "Erreur renvoyée par le site: $error" 
+        if $error;
+
+    my $nom_arret = $xp->findvalue(q{//div[@class='depart2']//span[@id='ctl00_ContentPlaceHolder_lblArret']});
+    trace 2, "Arrêt: $nom_arret";
+
+    my @nodes = $xp->findnodes('//table/tr[td]');
+
+    unless (@nodes) {
+        creve "Réponse du service CTS ne correspondant pas aux attentes. Peut-être ont-ils mis à jour leur système ?";
+    }
+
+    foreach my $node (@nodes) {
+        my $dest = $node->findvalue('td[2]');
+        my $time = $node->findvalue('td[3]');
+        push @passages, [$time, $dest];
+    }
+
+    trace 2, "Analyse du résultat terminée.";
+    return \@passages;
+}
+
+# load stops file from cache and return as code -> name hash
+sub load_stops {
+    my %stops;
+
+    my $data = decode_json(read_file($stops_file));
+    creve "Could not open stops file [$!]"
+        unless defined $data;
+
+    for my $stop (@$data) {
+        $stops{$stop->{code}} = $stop->{name};
+    }
+
+    return \%stops;
+}
+
+sub name_from_code {
+    my $code=shift;
+    my $stops = load_stops;
+    return $stops->{$code};
+}
+
+sub show_next_passages {
+    my $code = shift;
+    trace 2, "Recherche prochain passages pour code $code";
+
+    my $name = name_from_code $code;
+    say "Prochain passages à $name ($code):";
+
+    my $passages = get_passages $code;
+    say "$_->[0]: $_->[1]" for @$passages;
+}
+
+# find a stop code by fuzzy matching the given stop name
+sub find_stop_fuzzy {
+    my $pat = shift;
+    my $stops = load_stops;
+    my $ok_code = undef;
+    my @possible;
+
+    for my $code (sort { $a <=> $b} keys %$stops) {
+        if (fuzzy_match($pat, $stops->{$code})) {
+            push @possible, [ $code, $stops->{$code} ];
+        }
+    }
+
+    if (@possible == 1) {
+        return $possible[0][0];
+    }
+    elsif (@possible == 0) {
+        creve "Pas d'arrêts trouvés pour '$pat'";
+    }
+    else {
+        say "Plusieurs arrêts trouvés pour '$pat':";
+        printf("%3i %s\n", $_->[0], $_->[1]) for @possible;
+        exit -1;
+    }
+}
+
+##############################################################################
+# USER COMMANDS
+##############################################################################
+
+sub cmd_help() {
+    show_help;
+    exit 0;
+}
+
+sub cmd_version() {
     print <<"VERSION";
 $0 version $VERSION
-copyright 2011 by Martijn van der Kwast <martijn\@vdkwast.com> 
+copyright 2014 by Martijn van der Kwast <martijn\@vdkwast.com> 
 VERSION
     exit 0;
 }
 
-sub service_error {
-    print STDERR join(' ', @_) . "\n";
-    exit -2;
+sub cmd_list_stops {
+    my $stops = load_stops;
+
+    for my $code (sort { $a <=> $b} keys %$stops) {
+        printf "%3s %s\n", $code, $stops->{$code};
+    }
+
+    exit 0;
 }
 
-# Déterminer l'arrêt
+sub cmd_refresh_stops {
+    say "Refreshing stops file from $cts_api_url.";
+    get_stops;
+    exit 0;
+}
 
-GetOptions(%options) || abort_with_help;
+sub cmd_find_stop {
+    my $pat = $_[1];
+    my $stops = load_stops();
 
-my $arret=$ARGV[0];
-unless (defined $arret) {
-    $config_file = glob $config_file;
-    if (-f $config_file) {
-	open my $fh, '<', $config_file or die $!;
-	$arret=<$fh>;
-	chomp $arret;
+    for my $code (sort { $a <=> $b} keys %$stops) {
+        printf "%3s %s\n", $code, $stops->{$code}
+            if fuzzy_match($pat, $stops->{$code});
+    }
+
+    exit 0;
+}
+
+sub cmd_match_stop {
+    my $code = find_stop_fuzzy $_[1];
+    creve "Pas d'arrêts correspondant trouvés"
+        unless defined $code;
+    show_next_passages $code;
+    exit 0;
+}
+
+# options de ligne deocmmande
+my %options = (
+    'help|h' =>       \&cmd_help,
+    'verbose|v+' =>   \$verbose,
+    'version|V' =>    \&cmd_version,
+    'list|l' =>       \&cmd_list_stops,
+    'refresh|R' =>    \&cmd_refresh_stops,
+    'find|f=s' =>     \&cmd_find_stop,
+    'match|m=s' =>    \&cmd_match_stop,
+);
+
+make_config;
+
+my $codeset = langinfo(CODESET);
+@ARGV = map { decode $codeset, $_ } @ARGV;
+
+GetOptions(%options) or abort_with_help();
+
+# fallthrough: if no command line argument caused a cmd_xxx routine to be
+# called we are expecting a code.
+my $code = $ARGV[0];
+
+unless (defined $code) {
+    $code = get_default_code();
+    unless (defined $code) {
+        say "Code arrêt non-spécifié et non trouvé dans $default_stop_file.";
+        say "Utilisez --help pour plus d'informations";
+        exit -1;
     }
 }
-unless (defined $arret) {
-    print STDERR "Veuillez spécifier un code d'arrêt.\n";
-    exit -1;
+
+unless ($code =~ m/^\d+$/) {
+    $code = find_stop_fuzzy $code;
+    creve "Pas d'arrêts correspondant trouvés"
+        unless defined $code;
 }
 
-print "Recherche du code arrêt: '$arret'\n" if $verbose > 1;
+trace 1, "Recherche des passage pour l'arrêt: $code";
 
-# Téléchargement des infos sur le site CTS
-
-my ($heure, $min) = (localtime time)[2,1];
-my $url="http://tr.cts-strasbourg.fr/HorTRweb/ResultatsHoraires.aspx?arret=$arret&type=TOUS&heure=$heure&min=$min";
-
-printf "Téléchargement des informations sur '$url' pour l'heure %02d:%02d.\n",
-    $heure, $min if $verbose > 1;
-
-my $content = get $url;
-service_error "Service CTS non accessible." unless defined $content;
-
-print "Téléchargement terminé.\n" if $verbose > 1;
-
-# Analyse et affichage des infos
-
-my $xp = HTML::TreeBuilder::XPath->new;
-$xp->parse($content);
-
-my $error = $xp->findnodes(q{//div[@id='ctl00_ContentPlaceHolder_ValidationSummary1']/font});
-service_error "Erreur renvoyée par le site: $error\n" if $error;
-
-my $nom_arret = $xp->findvalue(q{//div[@class='depart2']//span[@id='ctl00_ContentPlaceHolder_lblArret']});
-print "Arrêt: $nom_arret\n" if $verbose;
-
-my @nodes = $xp->findnodes('//table/tr[td]');
-
-unless (@nodes) {
-    service_error "Réponse du service CTS ne correspondant pas aux attentes. Peut-être ont-ils mis à jour leur système ?";
-}
-
-foreach my $node (@nodes) {
-    my $dest = $node->findvalue('td[2]');
-    my $time = $node->findvalue('td[3]');
-    print "$time: $dest\n";
-}
-
-print "Analyse du résultat terminée.\n" if $verbose > 1;
+show_next_passages $code;
